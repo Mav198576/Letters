@@ -6,6 +6,32 @@ from datetime import datetime
 st.set_page_config(page_title="Credit Dispute Chatbot", layout="centered")
 st.title("🤖 AI Credit Dispute Chatbot")
 
+with st.expander("🔍 How We Score Your Credit Report"):
+    st.markdown("""
+We analyze your credit report and prioritize negative items for dispute using the following criteria:
+
+### 📊 Scoring Breakdown
+- **Age of Item**
+  - 🟢 Older than 12 months = +2 points (more likely to be removed)
+  - 🟡 Less than 12 months = +1 point
+
+- **Account Type & Status**
+  - 🔴 Charge-Off or Collection = +3 points
+  - 🔶 Multiple Late Payments = +2 points
+  - ⚠️ Balance exceeds limit = +2 points
+
+- **Recency**
+  - 🕒 Recently added collections = +1 point
+
+### 🏆 What This Means
+The higher the score, the more likely the item is:
+- Legally challengeable
+- Missing documentation
+- Impacting your credit score
+
+We recommend starting with the **highest scoring items first**.
+""")
+
 def months_since(date_str):
     report_date = datetime.strptime(date_str, "%Y-%m-%d")
     today = datetime.today()
@@ -99,15 +125,21 @@ if uploaded_file:
 
         recommendations = sorted(recommendations, key=lambda x: x["score"], reverse=True)
 
-        st.chat_message("assistant").write(f"Thanks, {consumer_info['name']}! I found {len(recommendations)} items that could be disputed:")
-        for rec in recommendations:
-            st.chat_message("assistant").write(f"• {rec['creditor']} — {rec['status']} — Score: {rec['score']} — Reason(s): {', '.join(rec['reasons'])}")
+        st.chat_message("assistant").write(f"✅ Report received. Found {len(recommendations)} dispute-worthy items:")
 
-        st.chat_message("assistant").write("Here are your dispute letters:")
         for i, item in enumerate(recommendations, start=1):
-            with st.expander(f"📨 Dispute Letter {i} - {item['creditor']}"):
-                st.text_area("Dispute Letter", generate_dispute_letter(consumer_info, item), height=300)
+            st.chat_message("assistant").markdown(
+                f"**{i}. {item['creditor']}**  
+Status: {item['status']}  
+Balance: ${item['balance']}  
+Reasons: {', '.join(item['reasons'])}"
+            )
+
+        st.subheader("📨 Dispute Letters")
+        for i, item in enumerate(recommendations, start=1):
+            letter = generate_dispute_letter(consumer_info, item)
+            with st.expander(f"View Letter {i}: {item['creditor']}"):
+                st.text_area("Dispute Letter", letter, height=300)
 
     except Exception as e:
-        st.chat_message("assistant").write("Oops! Something went wrong reading your file. Please try again.")
-        st.error(str(e))
+        st.chat_message("assistant").write(f"⚠️ Error reading report: {e}")
