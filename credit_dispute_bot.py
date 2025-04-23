@@ -3,6 +3,9 @@ import streamlit as st
 import json
 from datetime import datetime
 
+st.set_page_config(page_title="Credit Dispute Chatbot", layout="centered")
+st.title("🤖 AI Credit Dispute Chatbot")
+
 def months_since(date_str):
     report_date = datetime.strptime(date_str, "%Y-%m-%d")
     today = datetime.today()
@@ -77,43 +80,34 @@ Sincerely,
 {name}
 """
 
-st.set_page_config(page_title="Credit Dispute Chatbot", layout="centered")
-st.title("🤖 AI Credit Dispute Chatbot")
-
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# File upload trigger
-if "credit_data" not in st.session_state:
-    st.chat_message("assistant").write("Hi there! Please upload your JSON credit report to begin.")
-    uploaded = st.file_uploader("Upload JSON Credit Report", type="json")
-    if uploaded:
-        data = json.load(uploaded)
-        st.session_state["credit_data"] = data
-        st.session_state.messages.append({"role": "assistant", "text": "Thanks! I’ve reviewed your report. Ask me what items to dispute or say 'generate letters'."})
-else:
-    for msg in st.session_state.messages:
-        st.chat_message(msg["role"]).write(msg["text"])
+st.chat_message("assistant").write("Welcome! Please upload your JSON credit report to begin.")
 
-    prompt = st.chat_input("Ask me something about your credit report...")
-    if prompt:
-        st.chat_message("user").write(prompt)
-        st.session_state.messages.append({"role": "user", "text": prompt})
-
-        # Process question
-        data = st.session_state["credit_data"]
+uploaded_file = st.file_uploader("Upload JSON Credit Report", type="json")
+if uploaded_file:
+    try:
+        data = json.load(uploaded_file)
         consumer_info = data["consumer_info"]
-        recommendations = [score_item(i, "tradelines") for i in data.get("tradelines", [])]
-        recommendations += [score_item(i, "collections") for i in data.get("collections", [])]
+        recommendations = []
+
+        for item in data.get("tradelines", []):
+            recommendations.append(score_item(item, "tradelines"))
+        for item in data.get("collections", []):
+            recommendations.append(score_item(item, "collections"))
+
         recommendations = sorted(recommendations, key=lambda x: x["score"], reverse=True)
 
-        if "dispute" in prompt.lower():
-            response = f"I found {len(recommendations)} items you may want to dispute. The top one is: {recommendations[0]['creditor']} - {recommendations[0]['status']} (${recommendations[0]['balance']}) for reasons: {', '.join(recommendations[0]['reasons'])}."
-        elif "letter" in prompt.lower():
-            letters = [generate_dispute_letter(consumer_info, item) for item in recommendations]
-            response = "Here’s a sample dispute letter:\n\n" + letters[0][:1000] + ("..." if len(letters[0]) > 1000 else "")
-        else:
-            response = "Try asking me: 'What items should I dispute?' or 'Can you generate letters?'"
+        st.chat_message("assistant").write(f"Thanks, {consumer_info['name']}! I found {len(recommendations)} items that could be disputed:")
+        for rec in recommendations:
+            st.chat_message("assistant").write(f"• {rec['creditor']} — {rec['status']} — Score: {rec['score']} — Reason(s): {', '.join(rec['reasons'])}")
 
-        st.chat_message("assistant").write(response)
-        st.session_state.messages.append({"role": "assistant", "text": response})
+        st.chat_message("assistant").write("Here are your dispute letters:")
+        for i, item in enumerate(recommendations, start=1):
+            with st.expander(f"📨 Dispute Letter {i} - {item['creditor']}"):
+                st.text_area("Dispute Letter", generate_dispute_letter(consumer_info, item), height=300)
+
+    except Exception as e:
+        st.chat_message("assistant").write("Oops! Something went wrong reading your file. Please try again.")
+        st.error(str(e))
