@@ -128,7 +128,7 @@ if uploaded_file:
         st.chat_message("assistant").write(f"✅ Report received. Found {len(recommendations)} dispute-worthy items:")
 
         for i, item in enumerate(recommendations, start=1):
-            st.chat_message("assistant").markdown(
+            st.chat_message("assistant").write(
                 f"**{i}. {item['creditor']}**  
 Status: {item['status']}  
 Balance: ${item['balance']}  
