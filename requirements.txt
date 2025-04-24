@@ -1,0 +1,8 @@
+streamlit
+reportlab
+matplotlib
+pandas
+pymupdf
+plotly
+requests
+Pillow
