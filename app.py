@@ -1,0 +1,929 @@
+
+import streamlit as st
+import json
+import os
+from datetime import datetime
+from pathlib import Path
+from io import BytesIO
+from reportlab.pdfgen import canvas
+import matplotlib.pyplot as plt
+import pandas as pd
+
+st.set_page_config(page_title="AI Credit Disputer", layout="wide")
+st.title("📄 AI Credit Disputer")
+
+storage_dir = Path("stored_reports")
+log_path = Path("letter_logs.json")
+storage_dir.mkdir(exist_ok=True)
+
+# Load letter log
+if log_path.exists():
+    with open(log_path) as f:
+        letter_log = json.load(f)
+else:
+    letter_log = {}
+
+uploaded_file = st.file_uploader("Upload your credit report", type="json")
+
+if uploaded_file:
+    report_data = json.load(uploaded_file)
+    consumer_name = report_data.get("consumer_info", {}).get("name", "Unknown")
+    credit_score = report_data.get("consumer_info", {}).get("credit_score", 0)
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    consumer_key = consumer_name.replace(" ", "_")
+    consumer_dir = storage_dir / consumer_key
+    save_path = consumer_dir / timestamp
+    save_path.mkdir(parents=True, exist_ok=True)
+    with open(save_path / "report.json", "w") as f:
+        json.dump(report_data, f, indent=2)
+
+    # === Save score history ===
+    score_history_path = consumer_dir / "score_history.json"
+    if score_history_path.exists():
+        with open(score_history_path) as f:
+            history = json.load(f)
+    else:
+        history = []
+
+    history.append({"date": today, "score": credit_score})
+    with open(score_history_path, "w") as f:
+        json.dump(history, f, indent=2)
+
+    st.success(f"Report uploaded for {consumer_name} on {timestamp}")
+
+    # === Score Display + Graph ===
+    st.subheader("📈 Credit Score Overview")
+    score_color = "#e74c3c" if credit_score < 580 else "#f39c12" if credit_score < 670 else "#2ecc71"
+    st.markdown(f"<div style='padding:10px; border-left: 6px solid {score_color};'><h3>{consumer_name}</h3>"
+                f"<b>Score:</b> <span style='color:{score_color}; font-size:20px;'>{credit_score}</span></div>",
+                unsafe_allow_html=True)
+
+    if len(history) > 1:
+        df = pd.DataFrame(history)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+        st.line_chart(df.set_index("date")["score"])
+
+    # === Account Section ===
+    st.subheader("📋 Select Accounts to Dispute")
+    selected_accounts = []
+    items = report_data.get("tradelines", []) + report_data.get("collections", [])
+
+    for i, item in enumerate(items):
+        creditor = item.get("creditor_name") or item.get("agency_name", "Unknown")
+        balance = item.get("balance", item.get("amount", 0))
+        status = item.get("status", "N/A")
+        reported = item.get("last_reported", "N/A")
+
+        score = 0
+        breakdown = []
+        if "charge" in status.lower():
+            score += 3
+            breakdown.append("+3 Charge-off")
+        if "late" in status.lower():
+            score += 2
+            breakdown.append("+2 Late payments")
+        if balance and balance > 1000:
+            score += 2
+            breakdown.append("+2 High balance")
+        if "collection" in item.get("remarks", "").lower():
+            score += 2
+            breakdown.append("+2 Collection remark")
+        if not breakdown:
+            breakdown.append("0 – No indicators")
+
+        with st.container():
+            st.markdown(f"### {creditor}")
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"""**Status:** {status}  
+**Balance:** ${balance}  
+**Last Reported:** {reported}""")
+                st.markdown(f"🧠 **Dispute Score:** `{score}/10`")
+                with st.expander("🔍 Score Breakdown"):
+                    for line in breakdown:
+                        st.markdown(f"- {line}")
+            with col2:
+                selected = st.checkbox("Include in Letter", key=f"check_{i}")
+                if selected:
+                    selected_accounts.append({
+                        "creditor": creditor,
+                        "status": status,
+                        "balance": balance,
+                        "reported": reported,
+                        "index": i
+                    })
+
+    if selected_accounts:
+        bureau = st.selectbox("Select Bureau", ["TransUnion", "Experian", "Equifax"])
+        reason = st.selectbox("Dispute Reason", ["Not Mine", "Never Late", "Already Paid", "Wrong Balance", "Request Validation"])
+
+        if st.button("📄 Generate Multi-Item Letter PDF"):
+            buffer = BytesIO()
+            c = canvas.Canvas(buffer)
+            c.setFont("Helvetica", 12)
+            c.drawString(50, 800, f"{bureau}")
+            c.drawString(50, 780, f"Consumer: {consumer_name}")
+            c.drawString(50, 760, "Subject: Dispute Letter - Multiple Accounts")
+            c.drawString(50, 740, f"Dear {bureau},")
+            c.drawString(50, 720, "I am writing to dispute the following accounts:")
+
+            y = 700
+            log_entries = []
+            for item in selected_accounts:
+                c.drawString(60, y, f"• {item['creditor']} — {item['status']} — ${item['balance']} — {item['reported']}")
+                log_entries.append({
+                    "creditor": item['creditor'],
+                    "bureau": bureau,
+                    "reason": reason,
+                    "date": today
+                })
+                y -= 20
+                if y < 100:
+                    c.showPage()
+                    c.setFont("Helvetica", 12)
+                    y = 800
+
+            c.drawString(50, y-20, f"Dispute Reason: {reason}")
+            c.drawString(50, y-40, "Under the FCRA, please investigate and correct these items.")
+            c.drawString(50, y-60, f"Thank you,")
+            c.drawString(50, y-80, f"{consumer_name}")
+            c.save()
+            buffer.seek(0)
+
+            st.download_button("📥 Download Combined PDF", data=buffer, file_name=f"{consumer_key}_bulk_dispute_letter.pdf", mime="application/pdf")
+
+            # Save letter log
+            if consumer_key not in letter_log:
+                letter_log[consumer_key] = []
+            letter_log[consumer_key].extend(log_entries)
+            with open(log_path, "w") as f:
+                json.dump(letter_log, f, indent=2)
+
+# === View Letter History ===
+st.sidebar.title("📑 Letter History")
+if letter_log:
+    for person, entries in letter_log.items():
+        with st.sidebar.expander(person.replace("_", " ")):
+            for e in entries:
+                st.markdown(f"- {e['date']} | **{e['creditor']}** | {e['bureau']} | {e['reason']}")
+else:
+    st.sidebar.info("No letters generated yet.")
+
+# --- Phase 3: Add-on to AI Disputer All-in-One ---
+
+import fitz  # PyMuPDF for PDF parsing
+
+# Add PDF upload for conversion to JSON (mock example)
+st.sidebar.header("📄 PDF Report Import (Beta)")
+pdf_file = st.sidebar.file_uploader("Upload Credit Report (PDF)", type="pdf", key="pdf_report")
+if pdf_file:
+    text = ""
+    with fitz.open(stream=pdf_file.read(), filetype="pdf") as doc:
+        for page in doc:
+            text += page.get_text()
+
+    # Demo extraction logic (real app would parse structure properly)
+    st.sidebar.success("PDF text extracted!")
+    st.sidebar.write(text[:500] + "...")  # preview
+
+    # Convert into basic JSON-like structure (mock)
+    extracted = {
+        "consumer_info": {
+            "name": "Extracted User",
+            "credit_score": 620
+        },
+        "tradelines": [
+            {
+                "creditor_name": "Mock Creditor 1",
+                "status": "Charge-off",
+                "balance": 1540,
+                "last_reported": "2024-12-01",
+                "remarks": "collection"
+            },
+            {
+                "creditor_name": "Mock Creditor 2",
+                "status": "Late",
+                "balance": 980,
+                "last_reported": "2024-10-15",
+                "remarks": ""
+            }
+        ]
+    }
+
+    if st.sidebar.button("Import Extracted Data"):
+        with open("temp_pdf_report.json", "w") as f:
+            json.dump(extracted, f, indent=2)
+        st.session_state["imported_json"] = extracted
+        st.sidebar.success("Imported as structured JSON!")
+
+# Inject AI-generated dispute sequence example
+st.sidebar.header("🧠 AI Dispute Sequence (Demo)")
+if "imported_json" in st.session_state:
+    imported_data = st.session_state["imported_json"]
+    for i, item in enumerate(imported_data["tradelines"]):
+        creditor = item.get("creditor_name")
+        with st.sidebar.expander(f"{creditor} – Sequence"):
+            st.markdown("**Round 1 – Validation Letter**")
+            st.markdown(f"Dear {creditor}, I request validation of this debt...")
+
+            st.markdown("**Round 2 – Escalation**")
+            st.markdown(f"I still have not received proper validation for {creditor}...")
+
+            st.markdown("**Round 3 – Legal Reference**")
+            st.markdown(f"Under the FCRA and FDCPA, continued reporting without validation is unlawful...")
+
+# --- Branding + Dashboard View ---
+
+# Branding controls
+st.sidebar.header("🎨 Branding Options")
+agency_name = st.sidebar.text_input("Agency Name", value="My Credit Agency")
+primary_color = st.sidebar.color_picker("Primary Color", value="#2c3e50")
+logo_url = st.sidebar.text_input("Logo URL (optional)")
+
+# Custom header display
+st.markdown(f"<h2 style='color:{primary_color};'>{agency_name}</h2>", unsafe_allow_html=True)
+if logo_url:
+    st.image(logo_url, width=150)
+
+# === Dashboard View ===
+st.sidebar.title("📊 Dashboard")
+all_clients = [f.name for f in storage_dir.iterdir() if f.is_dir()]
+total_reports = sum(len(list((storage_dir / client).glob("*/*.json"))) for client in all_clients)
+st.sidebar.metric("Total Reports", total_reports)
+
+# Display recent uploads
+recent_uploads = []
+for client in all_clients:
+    client_path = storage_dir / client
+    folders = sorted(client_path.glob("*"), reverse=True)
+    if folders:
+        latest = folders[0]
+        json_file = latest / "report.json"
+        if json_file.exists():
+            with open(json_file) as f:
+                r = json.load(f)
+                recent_uploads.append({
+                    "client": client.replace("_", " "),
+                    "score": r.get("consumer_info", {}).get("credit_score", "N/A"),
+                    "date": latest.name
+                })
+
+if recent_uploads:
+    st.sidebar.markdown("**Recent Reports:**")
+    for r in recent_uploads[:5]:
+        st.sidebar.markdown(f"- {r['date']} | {r['client']} | Score: {r['score']}")
+
+# --- Phase 5: To-Do List, Calendar, and 45-Day Recheck ---
+
+# ========== TO-DO LIST ==========
+st.sidebar.header("✅ To-Do List")
+todo_path = Path("todo.json")
+
+# Load tasks
+if todo_path.exists():
+    with open(todo_path) as f:
+        todos = json.load(f)
+else:
+    todos = []
+
+new_task = st.sidebar.text_input("New Task")
+if st.sidebar.button("Add Task"):
+    if new_task:
+        todos.append({"task": new_task, "done": False})
+        with open(todo_path, "w") as f:
+            json.dump(todos, f, indent=2)
+
+for i, t in enumerate(todos):
+    checked = st.sidebar.checkbox(t["task"], value=t["done"], key=f"todo_{i}")
+    todos[i]["done"] = checked
+with open(todo_path, "w") as f:
+    json.dump(todos, f, indent=2)
+
+# ========== CALENDAR ==========
+st.sidebar.header("🗓️ Calendar Preview")
+today = datetime.today()
+st.sidebar.markdown(f"**Today:** {today.strftime('%A, %B %d, %Y')}")
+
+# ========== 45-DAY REPORT CHECK ==========
+st.sidebar.header("⏱️ 45-Day Report Reminders")
+
+due_clients = []
+for client in storage_dir.iterdir():
+    if not client.is_dir():
+        continue
+    folders = sorted(client.glob("*"), reverse=True)
+    if folders:
+        try:
+            last_date = datetime.strptime(folders[0].name, "%Y-%m-%d_%H-%M")
+            days_since = (today - last_date).days
+            if days_since >= 45:
+                due_clients.append((client.name.replace("_", " "), days_since))
+        except:
+            continue
+
+if due_clients:
+    st.sidebar.markdown("### Ready to Recheck:")
+    for name, days in due_clients:
+        st.sidebar.markdown(f"- **{name}** ({days} days ago)")
+else:
+    st.sidebar.info("No clients due yet.")
+
+# --- Phase 6: Full Client Portal with Login ---
+
+# ========== USER LOGIN SYSTEM ==========
+user_db_path = Path("users.json")
+if user_db_path.exists():
+    with open(user_db_path) as f:
+        user_db = json.load(f)
+else:
+    user_db = {
+        "admin@example.com": {
+            "password": "admin123",
+            "is_admin": True
+        }
+    }
+
+if "user" not in st.session_state:
+    st.session_state["user"] = None
+
+def login_user(email, password):
+    if email in user_db and user_db[email]["password"] == password:
+        st.session_state["user"] = {"email": email, "is_admin": user_db[email].get("is_admin", False)}
+        return True
+    return False
+
+def register_user(email, password):
+    if email not in user_db:
+        user_db[email] = {"password": password, "is_admin": False}
+        with open(user_db_path, "w") as f:
+            json.dump(user_db, f, indent=2)
+        return True
+    return False
+
+if not st.session_state["user"]:
+    st.sidebar.header("🔐 Login or Register")
+    email = st.sidebar.text_input("Email")
+    password = st.sidebar.text_input("Password", type="password")
+    if st.sidebar.button("Login"):
+        if login_user(email, password):
+            st.success("Logged in!")
+        else:
+            st.error("Invalid credentials.")
+    if st.sidebar.button("Register"):
+        if register_user(email, password):
+            st.success("Account created!")
+        else:
+            st.warning("Email already exists.")
+    st.stop()
+
+user = st.session_state["user"]
+st.sidebar.success(f"Logged in as: {user['email']}")
+
+# ========== PORTAL VIEW ==========
+if user["is_admin"]:
+    st.markdown("## 🧑‍💼 Admin Portal")
+    st.write("Access to all client reports, scores, and letters.")
+else:
+    st.markdown("## 🙋 Client Portal")
+    st.write("Your reports, scores, and letter tools below.")
+
+# --- Phase 7: Role Access + Branded PDFs + Mock Email Reminders ---
+
+# Load client branding from local storage (simulate database)
+branding_path = Path("branding.json")
+if branding_path.exists():
+    with open(branding_path) as f:
+        branding_data = json.load(f)
+else:
+    branding_data = {}
+
+# Let client save their branding info
+if not user["is_admin"]:
+    st.sidebar.header("🎨 Your Branding")
+    agency_brand = st.sidebar.text_input("Your Agency Name", value=branding_data.get(user["email"], {}).get("name", ""))
+    agency_logo = st.sidebar.text_input("Logo URL", value=branding_data.get(user["email"], {}).get("logo", ""))
+    if st.sidebar.button("Save Branding"):
+        branding_data[user["email"]] = {"name": agency_brand, "logo": agency_logo}
+        with open(branding_path, "w") as f:
+            json.dump(branding_data, f, indent=2)
+        st.sidebar.success("Branding saved!")
+
+# Filter client data by login identity
+if not user["is_admin"]:
+    consumer_key = user["email"].replace("@", "_").replace(".", "_")
+    user_storage_dir = storage_dir / consumer_key
+    user_storage_dir.mkdir(exist_ok=True)
+    storage_dir = user_storage_dir  # override global path for this session
+
+# PDF branding override
+client_brand_name = branding_data.get(user["email"], {}).get("name", "")
+client_logo = branding_data.get(user["email"], {}).get("logo", "")
+
+# Modify PDF generator (inject branding into previous letter section)
+# Locate the previous canvas drawing section and include header
+# This override will replace the start of letter writing
+
+if selected_accounts:
+    if st.button("📄 Generate Multi-Item Letter PDF"):
+        buffer = BytesIO()
+        c = canvas.Canvas(buffer)
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(50, 820, client_brand_name or agency_name)
+        if client_logo:
+            try:
+                import requests
+                from PIL import Image
+                from io import BytesIO as PILBytes
+                response = requests.get(client_logo)
+                img = Image.open(PILBytes(response.content))
+                c.drawInlineImage(img, 400, 760, width=140, preserveAspectRatio=True)
+            except:
+                c.setFont("Helvetica", 8)
+                c.drawString(400, 760, "(Logo failed to load)")
+        c.setFont("Helvetica", 12)
+        c.drawString(50, 800, f"{bureau}")
+        c.drawString(50, 780, f"Consumer: {consumer_name}")
+        c.drawString(50, 760, "Subject: Dispute Letter - Multiple Accounts")
+        c.drawString(50, 740, f"Dear {bureau},")
+        c.drawString(50, 720, "I am writing to dispute the following accounts:")
+
+        y = 700
+        log_entries = []
+        for item in selected_accounts:
+            c.drawString(60, y, f"• {item['creditor']} — {item['status']} — ${item['balance']} — {item['reported']}")
+            log_entries.append({
+                "creditor": item['creditor'],
+                "bureau": bureau,
+                "reason": reason,
+                "date": today
+            })
+            y -= 20
+            if y < 100:
+                c.showPage()
+                c.setFont("Helvetica", 12)
+                y = 800
+
+        c.drawString(50, y-20, f"Dispute Reason: {reason}")
+        c.drawString(50, y-40, "Under the FCRA, please investigate and correct these items.")
+        c.drawString(50, y-60, f"Thank you,")
+        c.drawString(50, y-80, f"{consumer_name}")
+        c.save()
+        buffer.seek(0)
+
+        st.download_button("📥 Download Branded PDF", data=buffer, file_name=f"{consumer_key}_bulk_dispute_letter.pdf", mime="application/pdf")
+
+        # Save letter log
+        if consumer_key not in letter_log:
+            letter_log[consumer_key] = []
+        letter_log[consumer_key].extend(log_entries)
+        with open(log_path, "w") as f:
+            json.dump(letter_log, f, indent=2)
+
+# --- 45-day Reminder Mock Email Log ---
+email_log_path = Path("email_log.json")
+if email_log_path.exists():
+    with open(email_log_path) as f:
+        email_log = json.load(f)
+else:
+    email_log = []
+
+if user["is_admin"]:
+    st.subheader("📧 Mock Email Log")
+    new_reminders = []
+    for client in due_clients:
+        email = client[0].replace(" ", "_").replace("_at_", "@")
+        reminder_entry = {"to": email, "subject": "Time to upload new credit report!", "date": today.strftime("%Y-%m-%d")}
+        if reminder_entry not in email_log:
+            new_reminders.append(reminder_entry)
+
+    if new_reminders:
+        email_log.extend(new_reminders)
+        with open(email_log_path, "w") as f:
+            json.dump(email_log, f, indent=2)
+
+    for e in email_log[-10:]:
+        st.markdown(f"- To: **{e['to']}** | Subject: *{e['subject']}* | Date: {e['date']}")
+
+# --- Phase 8: SMTP Email + Zapier Webhook + Analytics ---
+
+import smtplib
+from email.message import EmailMessage
+import requests
+
+# ========== SMTP CONFIG ==========
+st.sidebar.header("✉️ SMTP Email Settings (Admin)")
+smtp_host = st.sidebar.text_input("SMTP Server", value="smtp.gmail.com")
+smtp_port = st.sidebar.number_input("Port", value=587)
+smtp_user = st.sidebar.text_input("Email Username", value="", type="default")
+smtp_pass = st.sidebar.text_input("Email Password", value="", type="password")
+
+# ========== SEND REAL EMAILS ==========
+def send_email(to_email, subject, body):
+    try:
+        msg = EmailMessage()
+        msg["From"] = smtp_user
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body)
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_pass)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        st.error(f"Email error: {e}")
+        return False
+
+if user["is_admin"] and st.sidebar.button("📧 Send All Due Reminders"):
+    for client, days in due_clients:
+        to_email = client.replace(" ", "_") + "@demo.com"
+        subject = "Time to upload your new credit report"
+        body = f"Hi {client}, it’s been {days} days since your last upload. Please log in and upload your updated report."
+        send_email(to_email, subject, body)
+    st.success("Reminders sent!")
+
+# ========== ZAPIER TRIGGER ==========
+zapier_url = st.sidebar.text_input("Zapier Webhook URL (optional)")
+def trigger_zapier(event, payload):
+    if zapier_url:
+        try:
+            requests.post(zapier_url, json={"event": event, "payload": payload})
+        except Exception as e:
+            st.warning(f"Zapier trigger failed: {e}")
+
+# Trigger when user uploads a file
+if uploaded_file:
+    trigger_zapier("report_uploaded", {"user": user["email"], "score": credit_score})
+
+# Trigger when PDF letter is downloaded
+if selected_accounts and st.button("Trigger Zapier for Letter"):
+    trigger_zapier("letter_generated", {"user": user["email"], "creditors": [x["creditor"] for x in selected_accounts]})
+    st.success("Zapier event sent!")
+
+# ========== CLIENT ANALYTICS ==========
+if not user["is_admin"]:
+    st.subheader("📊 Your Score Trends")
+    history_file = storage_dir / "score_history.json"
+    if history_file.exists():
+        with open(history_file) as f:
+            hist = json.load(f)
+        df = pd.DataFrame(hist)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+        st.line_chart(df.set_index("date")["score"])
+
+    letter_count = len(letter_log.get(consumer_key, []))
+    st.metric("Total Letters Sent", letter_count)
+
+    # Optional basic stat: letters per dispute score
+    scores = [3 if "charge" in l["reason"].lower() else 2 for l in letter_log.get(consumer_key, [])]
+    if scores:
+        avg_score = round(sum(scores) / len(scores), 2)
+        st.metric("Avg Dispute Weight", avg_score)
+
+# --- Phase 9: Success Tracking, Preview/Download, Custom Status Tags ---
+
+# Custom status field storage
+status_file = Path("dispute_statuses.json")
+if status_file.exists():
+    with open(status_file) as f:
+        custom_statuses = json.load(f)
+else:
+    custom_statuses = {}
+
+# Add custom statuses (admin only)
+if user["is_admin"]:
+    st.sidebar.header("⚙️ Custom Dispute Statuses")
+    new_status = st.sidebar.text_input("Add New Status")
+    if st.sidebar.button("Add Status"):
+        if new_status not in custom_statuses:
+            custom_statuses[new_status] = {}
+            with open(status_file, "w") as f:
+                json.dump(custom_statuses, f, indent=2)
+            st.sidebar.success("Status added.")
+
+# Show status options on each account (if user is client)
+account_status_data = {}
+
+st.subheader("📌 Account Status Tracker")
+if uploaded_file or "imported_json" in st.session_state:
+    for i, item in enumerate(items):
+        creditor = item.get("creditor_name") or item.get("agency_name", "Unknown")
+        status_key = f"{consumer_key}_{creditor}_{i}"
+
+        current_status = custom_statuses.get(status_key, {}).get("status", "Not Set")
+        st.markdown(f"**{creditor}** — Current Status: `{current_status}`")
+
+        if custom_statuses:
+            chosen = st.selectbox("Update Status", list(custom_statuses.keys()), key=f"statusbox_{i}")
+            if st.button(f"Update Status for {creditor}", key=f"updatestatus_{i}"):
+                custom_statuses[status_key] = {
+                    "status": chosen,
+                    "date": datetime.today().strftime("%Y-%m-%d")
+                }
+                with open(status_file, "w") as f:
+                    json.dump(custom_statuses, f, indent=2)
+                st.success(f"{creditor} updated to: {chosen}")
+
+# Dispute result effectiveness
+if not user["is_admin"]:
+    st.subheader("✅ Dispute Effectiveness")
+    status_stats = {}
+    for k, v in custom_statuses.items():
+        if k.startswith(consumer_key):
+            s = v["status"]
+            status_stats[s] = status_stats.get(s, 0) + 1
+    if status_stats:
+        for s, count in status_stats.items():
+            st.markdown(f"- **{s}**: {count} account(s)")
+
+# Secure preview of uploaded JSON reports (client only)
+if not user["is_admin"]:
+    st.subheader("🔍 View Uploaded Credit Reports")
+    client_path = Path("stored_reports") / consumer_key
+    report_files = list(client_path.glob("**/report.json"))
+    if report_files:
+        for file in sorted(report_files, reverse=True):
+            with open(file) as f:
+                report_data = json.load(f)
+            with st.expander(f"Report: {file.parent.name}"):
+                st.json(report_data)
+                st.download_button("Download JSON", data=json.dumps(report_data, indent=2),
+                                   file_name=f"{file.parent.name}_report.json", mime="application/json")
+
+# --- Phase 10: Mobile UI, Drag-and-Drop Upload, Client Messaging ---
+
+# ========== DRAG-AND-DROP REPORT UPLOAD ==========
+st.subheader("📂 Upload Credit Report")
+uploaded_drag = st.file_uploader("Drop your JSON or PDF file here", type=["json", "pdf"], label_visibility="collapsed")
+
+if uploaded_drag and uploaded_drag.name.endswith(".json"):
+    report_data = json.load(uploaded_drag)
+    st.success("JSON report uploaded successfully.")
+    st.session_state["report_data"] = report_data
+
+elif uploaded_drag and uploaded_drag.name.endswith(".pdf"):
+    text = ""
+    with fitz.open(stream=uploaded_drag.read(), filetype="pdf") as doc:
+        for page in doc:
+            text += page.get_text()
+    st.session_state["report_data"] = {
+        "consumer_info": {"name": "Parsed PDF", "credit_score": 630},
+        "tradelines": [{"creditor_name": "PDF Creditor", "status": "Late", "balance": 890, "last_reported": "2024-11-10"}]
+    }
+    st.success("PDF parsed and report structure created.")
+
+# Use parsed report if present
+if "report_data" in st.session_state:
+    report_data = st.session_state["report_data"]
+    consumer_name = report_data.get("consumer_info", {}).get("name", "Unknown")
+    credit_score = report_data.get("consumer_info", {}).get("credit_score", 0)
+    tradelines = report_data.get("tradelines", [])
+    st.markdown(f"**Consumer:** {consumer_name} — **Score:** {credit_score}")
+    for item in tradelines:
+        st.markdown(f"- {item['creditor_name']} | {item['status']} | ${item['balance']}")
+
+# ========== MOBILE UI OPTIMIZATION ==========
+st.markdown("""
+<style>
+    @media (max-width: 768px) {
+        .block-container {
+            padding: 1rem !important;
+        }
+        .css-1cpxqw2 {
+            flex-direction: column !important;
+        }
+        .css-1d391kg {
+            flex-direction: column !important;
+        }
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# ========== CLIENT MESSAGE CENTER ==========
+message_file = Path("messages.json")
+if message_file.exists():
+    with open(message_file) as f:
+        all_messages = json.load(f)
+else:
+    all_messages = []
+
+if not user["is_admin"]:
+    st.subheader("💬 Send Message to Admin")
+    msg = st.text_area("Your Message")
+    if st.button("Send Message"):
+        all_messages.append({
+            "from": user["email"],
+            "to": "admin",
+            "text": msg,
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+        })
+        with open(message_file, "w") as f:
+            json.dump(all_messages, f, indent=2)
+        st.success("Message sent.")
+
+if user["is_admin"]:
+    st.subheader("📥 Client Messages")
+    for m in reversed(all_messages[-10:]):
+        st.markdown(f"**{m['from']}** on {m['date']}")
+        st.markdown(f"> {m['text']}")
+        st.markdown("---")
+
+# --- Phase 11: Client Progress Bar Tracker ---
+
+from streamlit.components.v1 import html
+
+if not user["is_admin"]:
+    st.subheader("📈 Dispute Progress Tracker")
+
+    total_accounts = len(items)
+    resolved_statuses = ["Removed", "Resolved", "Verified Deleted"]
+    active_statuses = ["Pending", "In Dispute", "Escalated", "Round 1", "Round 2", "Round 3"]
+
+    resolved_count = 0
+    active_count = 0
+
+    for i, item in enumerate(items):
+        creditor = item.get("creditor_name") or item.get("agency_name", "Unknown")
+        status_key = f"{consumer_key}_{creditor}_{i}"
+        status_obj = custom_statuses.get(status_key, {})
+        status = status_obj.get("status", "")
+
+        if status in resolved_statuses:
+            resolved_count += 1
+        elif status in active_statuses:
+            active_count += 1
+
+    percent_resolved = int((resolved_count / total_accounts) * 100) if total_accounts > 0 else 0
+
+    # Progress bar color
+    color = "#e74c3c" if percent_resolved < 25 else "#f1c40f" if percent_resolved < 75 else "#2ecc71"
+    st.markdown(f"<div style='margin:10px 0; font-weight:bold;'>Progress: {percent_resolved}% Resolved</div>", unsafe_allow_html=True)
+    html(f"""
+    <div style='width:100%; background:#eee; border-radius:5px;'>
+      <div style='width:{percent_resolved}%; background:{color}; height:20px; border-radius:5px;'></div>
+    </div>
+    """, height=30)
+
+    # Status breakdown
+    st.markdown("#### Account Status Breakdown")
+    for s in resolved_statuses + active_statuses:
+        count = sum(1 for k, v in custom_statuses.items() if k.startswith(consumer_key) and v.get("status") == s)
+        if count > 0:
+            st.markdown(f"- **{s}**: {count}")
+
+# --- Phase 12: Timeline, Score Comparison, AI Dispute Priority ---
+
+import plotly.graph_objects as go
+
+# ========== Score Change Comparison ==========
+if not user["is_admin"]:
+    st.subheader("📉 Score Improvement")
+
+    score_file = storage_dir / "score_history.json"
+    if score_file.exists():
+        with open(score_file) as f:
+            history = json.load(f)
+
+        if len(history) >= 2:
+            first = history[0]["score"]
+            latest = history[-1]["score"]
+            change = latest - first
+            st.metric("Score Change", f"{change:+} points", delta_color="normal")
+
+            # Plot line chart
+            df = pd.DataFrame(history)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values("date")
+            st.line_chart(df.set_index("date")["score"])
+        else:
+            st.info("Not enough uploads to compare scores.")
+
+# ========== Dispute Timeline ==========
+if not user["is_admin"]:
+    st.subheader("🕒 Dispute Round Timeline")
+
+    for i, item in enumerate(items):
+        creditor = item.get("creditor_name") or item.get("agency_name", "Unknown")
+        status_key = f"{consumer_key}_{creditor}_{i}"
+        status_history = [v for k, v in custom_statuses.items() if k == status_key]
+
+        if status_history:
+            timeline = [status_history[0]["status"]]
+            dates = [status_history[0].get("date", "N/A")]
+
+            fig = go.Figure(go.Scatter(
+                x=dates,
+                y=timeline,
+                mode="lines+markers",
+                name=creditor,
+                line=dict(shape="hv", color="blue")
+            ))
+            fig.update_layout(title=creditor, height=200)
+            st.plotly_chart(fig, use_container_width=True)
+
+# ========== AI-Based Dispute Priority ==========
+if not user["is_admin"]:
+    st.subheader("🤖 AI Dispute Priority Suggestion")
+
+    ranked = []
+    for i, item in enumerate(items):
+        creditor = item.get("creditor_name") or item.get("agency_name", "Unknown")
+        score = 0
+        status = item.get("status", "").lower()
+        remarks = item.get("remarks", "").lower()
+        balance = item.get("balance", item.get("amount", 0))
+
+        if "charge" in status:
+            score += 3
+        if "late" in status:
+            score += 2
+        if "collection" in remarks:
+            score += 2
+        if balance and balance > 1000:
+            score += 1
+
+        ranked.append((creditor, score))
+
+    ranked.sort(key=lambda x: x[1], reverse=True)
+    st.markdown("### 🔝 Suggested Dispute Targets")
+    for cred, score in ranked[:5]:
+        st.markdown(f"- **{cred}** — Priority Score: `{score}/10`")
+
+# --- Phase 13: Admin Analytics, CSV Export, SaaS Readiness ---
+
+import csv
+
+# ========== ADMIN ANALYTICS ==========
+if user["is_admin"]:
+    st.subheader("📊 Admin Analytics Dashboard")
+
+    total_users = len([u for u in user_db if not user_db[u].get("is_admin")])
+    total_reports = 0
+    total_letters = 0
+    avg_scores = []
+
+    for client in storage_dir.iterdir():
+        if not client.is_dir():
+            continue
+        # Count reports
+        report_folders = list(client.glob("*"))
+        total_reports += len(report_folders)
+
+        # Score average
+        score_file = client / "score_history.json"
+        if score_file.exists():
+            with open(score_file) as f:
+                history = json.load(f)
+                scores = [entry["score"] for entry in history]
+                avg = sum(scores) / len(scores) if scores else 0
+                avg_scores.append(avg)
+
+        # Letter counts
+        client_key = client.name
+        total_letters += len(letter_log.get(client_key, []))
+
+    st.metric("Total Clients", total_users)
+    st.metric("Total Reports", total_reports)
+    st.metric("Total Dispute Letters", total_letters)
+    if avg_scores:
+        overall_avg = round(sum(avg_scores) / len(avg_scores), 2)
+        st.metric("Avg Client Score", overall_avg)
+
+# ========== EXPORT CSV ==========
+if user["is_admin"]:
+    st.subheader("📥 Export User Activity Log (CSV)")
+
+    export_data = []
+    for user_key, entries in letter_log.items():
+        for e in entries:
+            export_data.append({
+                "Client": user_key.replace("_", " "),
+                "Creditor": e["creditor"],
+                "Bureau": e["bureau"],
+                "Reason": e["reason"],
+                "Date": e["date"]
+            })
+
+    if export_data:
+        csv_file = "user_letter_log.csv"
+        with open(csv_file, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=export_data[0].keys())
+            writer.writeheader()
+            writer.writerows(export_data)
+
+        with open(csv_file, "r") as f:
+            csv_content = f.read()
+
+        st.download_button("📄 Download CSV", data=csv_content, file_name="user_letter_log.csv", mime="text/csv")
+    else:
+        st.info("No data to export.")
+
+# ========== SaaS MODE SETTINGS ==========
+st.sidebar.header("⚙️ SaaS Mode")
+demo_mode = st.sidebar.checkbox("Enable Demo Mode")
+if demo_mode:
+    st.sidebar.warning("Demo mode enabled: No data saved, limited access.")
